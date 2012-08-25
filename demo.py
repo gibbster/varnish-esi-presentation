@@ -9,15 +9,19 @@ def slow_query():
   return "Slow query executed at " \
       + time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime())
   
+@app.route('/quick')
 def quick_query():
   time.sleep(0.1)
-  return "Quick query executed at " \
-      + time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime())
+  response = make_response("Quick query executed at " \
+      + time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime()))
+  response.headers['Cache-Control'] = 'max-age=0'
+  return response
 
 @app.route('/')
 def show_front_page():
   response = make_response( \
       render_template('front_page.html', slow_query=slow_query(), quick_query=quick_query()))
+  response.headers['Cache-Control'] = 'max-age=0'
   return response
 
 if __name__ == '__main__':
