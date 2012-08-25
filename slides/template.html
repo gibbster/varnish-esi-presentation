@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Content caching with Varnish and ESI</title>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="chrome=1">
+  <!--<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">-->
+  <!--<meta name="viewport" content="width=device-width, initial-scale=1.0">-->
+  <!--This one seems to work all the time, but really small on ipad-->
+  <!--<meta name="viewport" content="initial-scale=0.4">-->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="stylesheet" media="all" href="theme/css/default.css">
+  <link rel="stylesheet" media="only screen and (max-device-width: 480px)" href="theme/css/phone.css">
+  <base target="_blank"> <!-- This amazingness opens all links in a new tab. -->
+  <script data-main="js/slides" src="js/require-1.0.8.min.js"></script>
+</head>
+<body style="opacity: 0">
+
+<slides class="layout-widescreen">
+
+  <slide class="title-slide segue nobackground">
+    <!-- The content of this hgroup is replaced programmatically through the slide_config.json. -->
+    <hgroup class="auto-fadein">
+      <h1 data-config-title><!-- populated from slide_config.json --></h1>
+      <h2 data-config-subtitle><!-- populated from slide_config.json --></h2>
+      <p data-config-presenter><!-- populated from slide_config.json --></p>
+    </hgroup>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>What are we trying to achieve?</h2>
+    </hgroup>
+    <article>
+      <ul class="build">
+        <li>According to Forrester Research, two seconds is the threshold for a
+        web page to be considered slow</li>
+        <li>Why is this important? Slow sites:
+          <ul class="build">
+            <li>Lead to lost sales. Walmart Labs found a "sharp decline in
+            conversion rates as average site load time increases from 1 to 4
+            seconds"</li>
+            <li>The same study found that "bounce rates strongly correlates to
+            page speed"
+            <li>Are considered unprofessional.</l>
+          </ul>
+        </li>
+        <li>Not a replacement for scalability, but defers scaling concerns</li>
+        <li>Programming language is not the answer! Architecture is: hence,
+        caching</li>
+      </ul>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Layers of caching</h2>
+      <h3>"Caching is like an onion..."</h3>
+    </hgroup>
+    <article>
+      <ul class="build">
+        <li>There are some easy wins to be had
+          <ul class="build">
+            <li>HTTP caching: serving directly from the client!</li>
+            <li>Page/Fragment caching: avoiding the application server</li>
+            <li>Object caching: avoiding the database</li>
+          </ul>
+        </li>
+        <li>Object caching is great, but with a little thought higher level
+        caching can lead to better results with less effort</li>
+      </ul>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Sample application</h2>
+    </hgroup>
+    <article class="smaller">
+      <pre class="prettyprint" data-lang="python">
+      from flask import Flask, request, session, g, redirect, url_for, abort, render_template, make_response
+      import time
+
+      app = Flask(__name__)
+
+      <b>def slow_query():
+        time.sleep(10)
+        return "Slow query executed at " + time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime()) </b>
+                    
+      <b>def quick_query():
+        time.sleep(0.1)
+        return "Quick query executed at " + time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime()) </b>
+
+      <b> @app.route('/')
+      def show_front_page():
+        response = make_response(render_template('front_page.html', \
+          slow_query=slow_query(), quick_query=quick_query()))
+        return response </b>
+
+      if __name__ == '__main__':
+        app.debug = True
+        app.run(host='0.0.0.0')
+    </pre>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Sample application, continued</h2>
+    </hgroup>
+    <article>
+      <pre class="prettyprint" data-lang="html">
+        &lt;html&gt;
+          &lt;body&gt;
+            &lt;h1&gt;Varnish demo&lt;/h1&gt;
+            &lt;p&gt;
+              {{slow_query}}
+            &lt;/p&gt;
+            &lt;p&gt;
+              {{quick_query}}
+            &lt;/p&gt; 
+          &lt;/body&gt;
+        &lt;/html&gt;
+      </pre>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Initial Benchmarks</h2>
+    </hgroup>
+    <article class="smaller">
+      <pre class="prettyprint" data-lang="shell">
+      ~ ➤ ab -n 10 http://localhost:5000/                                                                                                                 
+      This is ApacheBench, Version 2.3 <$Revision: 655654 $>
+      Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
+      Licensed to The Apache Software Foundation, http://www.apache.org/
+
+      Benchmarking localhost (be patient).....done
+
+      Concurrency Level:      1
+      Time taken for tests:   100.589 seconds
+      Complete requests:      10
+      Failed requests:        0
+      Write errors:           0
+      Total transferred:      3580 bytes
+      HTML transferred:       2040 bytes
+      Requests per second:    0.10 [#/sec] (mean)
+      Time per request:       10058.943 [ms] (mean)
+      Time per request:       10058.943 [ms] (mean, across all concurrent
+      requests)
+      Transfer rate:          0.03 [Kbytes/sec] received
+      </pre>
+    </article>
+  </slide>
+
+
+  <slide>
+    <hgroup>
+      <h2>(Mis)configuring Varnish</h2>
+    </hgroup>
+    <article>
+      <ul class="build">
+        <li>If Varnish doesn't believe that the content is cachable, then it
+          will 'pass-though' to the backend. If all the requests are being
+          passed through, then Varnish will just be adding an overhead</li>
+        <li>Varnish is pretty picky, so any unexplained cookies will cause it
+          to pass though</li>
+        <li>The easiest way to ensure that Varnish doesn't cache the content is
+          to return a http header that tells it not to</li>
+        <li>
+          <pre class="prettyprint" data-lang="python">
+          ...
+          @app.route('/')
+          def show_front_page():
+            response = make_response(render_template('front_page.html', \
+              slow_query=slow_query(), quick_query=quick_query()))
+            <b>response.headers['Cache-Control'] = 'max-age=0'</b>
+            return response
+          ...
+        </pre>
+        </li>
+      </ul>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Misconfigured Varnish Benchmarks</h2>
+    </hgroup>
+    <article class="smaller">
+      <pre class="prettyprint" data-lang="shell">
+      ~ ➤ ab -n 10 http://localhost:6081/                                                                                                                 
+      This is ApacheBench, Version 2.3 <$Revision: 655654 $>
+      Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
+      Licensed to The Apache Software Foundation, http://www.apache.org/
+
+      Benchmarking localhost (be patient).....done
+
+      <b>Time taken for tests:   100.592 seconds</b>
+      Complete requests:      10
+      Failed requests:        0
+      Write errors:           0
+      Total transferred:      4740 bytes
+      HTML transferred:       2040 bytes
+      Requests per second:    0.10 [#/sec] (mean)
+      Time per request:       10059.219 [ms] (mean)
+      Time per request:       10059.219 [ms] (mean, across all concurrent
+      requests)
+      Transfer rate:          0.05 [Kbytes/sec] received
+      </pre>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Configuring content expiring in Varnish</h2>
+    </hgroup>
+    <article>
+      <ul class="build">
+        <li>Varnish relies on standard HTTP headers to determine content
+        expiry</li>
+        <li>Let's see what effect changing the content expiry to one minute
+        will have on the benchmarks
+        <li>
+          <pre class="prettyprint" data-lang="python">
+          ...
+          @app.route('/')
+          def show_front_page():
+            response = make_response(render_template('front_page.html', \
+              slow_query=slow_query(), quick_query=quick_query()))
+            <b>response.headers['Cache-Control'] = 'max-age=60'</b>
+            return response
+          ...
+        </pre>
+        </li>
+      </ul>
+    </article>
+  </slide>
+
+
+  <slide>
+    <hgroup>
+      <h2>Varnish Benchmarks for one minute timeout</h2>
+    </hgroup>
+    <article class="smaller">
+      <pre class="prettyprint" data-lang="shell">
+      ~ ➤ ab -n 10 http://localhost:6081/                                                                                                                 
+      This is ApacheBench, Version 2.3 <$Revision: 655654 $>
+      Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
+      Licensed to The Apache Software Foundation, http://www.apache.org/
+
+      Benchmarking localhost (be patient).....done
+
+      Concurrency Level:      1
+      <b>Time taken for tests:   10.098 seconds</b>
+      Complete requests:      10
+      Failed requests:        0
+      Write errors:           0
+      Total transferred:      4849 bytes
+      HTML transferred:       2040 bytes
+      Requests per second:    0.99 [#/sec] (mean)
+      Time per request:       1009.786 [ms] (mean)
+      Time per request:       1009.786 [ms] (mean, across all concurrent
+      requests)
+      Transfer rate:          0.47 [Kbytes/sec] received
+      </pre>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Using Varnish with difficult content</h2>
+    </hgroup>
+    <article>
+      <ul class="build">
+        <li>The throughput Varnish can achieve is very impressive, but there is
+          a wide variety of content that is difficult to cache in this way
+          <ul class="build">
+            <li>Frequently updated content or "real time" content</li>
+            <li>Content that is customized based on user segment or other
+              variables</li>
+          </ul>
+        </li>
+        <li>If the entire page is highly dynamic or partitioned, there's not
+          much we can do. However, there are a few techniques we can use to
+          deal with a page that is mostly static
+          <ul class="build">
+            <li>Bypassing Varnish for this content, and using a lower level
+              cache to help (i.e. memcache)</li>
+            <li>Serving the common content through Varnish, and using AJAX to
+              pull in dynamic content (e.g. for usernames)</li>
+            <li>Using Edge Side Includes (ESI)</li>
+          </ul>
+        </li>
+      </ul>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Difficult content in our sample application</h2>
+    </hgroup>
+    <article>
+      <ul class="build">
+        <li>Recall that our sample app has two queries
+          <pre class="prettyprint" data-lang="python">
+            def slow_query():
+              time.sleep(10)
+              return "Slow query executed at " + time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime())
+                          
+            def quick_query():
+              time.sleep(0.1)
+              return "Quick query executed at " + time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime())
+          </pre>
+        </li>
+        <li>Suppose the slow query only needs to be updated once every five
+          minutes, whereas the quick query needs to be realtime
+        </li>
+        <li>Without any of the techniques mentioned in the previous slide, we
+          would have to set our max age to the minimum of the two requirements:
+          i.e. max-age = 0
+        </li>
+      </ul>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>ESI application</h2>
+    </hgroup>
+    <article class="smaller">
+      <pre class="prettyprint" data-lang="html">
+      @app.route('/quick')
+      def quick_query():
+        time.sleep(0.1)
+        response = make_response("Quick query executed at " \
+          + time.strftime("%a, %d %b %Y %H:%M:%S", time.gmtime()))
+        response.headers['Cache-Control'] = 'max-age=0'
+        return response
+
+      @app.route('/')
+      def show_front_page():
+        response = make_response( \
+          render_template('front_page.html', slow_query=slow_query(), quick_query=quick_query()))
+        response.headers['Cache-Control'] = 'max-age=0'
+        return response
+      </pre>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>ESI application, cont.</h2>
+    </hgroup>
+    <article class="smaller">
+      <pre class="prettyprint" data-lang="html">
+        &lt;html&gt;
+          &lt;body&gt;
+            &lt;h1&gt;Varnish demo&lt;/h1&gt;
+            &lt;p&gt;
+              {{slow_query}}
+            &lt;/p&gt;
+            &lt;p&gt;
+            <b> &lt;esi:include src="/quick"/&gt; </b>
+            &lt;/p&gt; 
+          &lt;/body&gt;
+        &lt;/html&gt;
+      </pre>
+      <pre class="prettyprint" data-lang="shell">
+        backend default {
+              .host = "127.0.0.1";
+              .port = "5000";
+        }
+
+        <b>sub vcl_fetch {
+            if (req.url == "/") {
+              set beresp.do_esi = true;
+              set beresp.ttl = 5 m;
+            } 
+        }</b>
+      </pre>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>ESI application, cont.</h2>
+    </hgroup>
+    <article class="smaller">
+      <ul class="build">
+        <li>Note we set the ttl manually, to avoid external proxies from
+          caching the content</li>
+        <li>Great improvements in performance compared to the no-cache
+          implementation
+          <pre class="prettyprint" data-lang="shell">
+            ~ ➤ ab -n 100 http://localhost:6081/                                                                                                                
+            This is ApacheBench, Version 2.3 <$Revision: 655654 $>
+            Copyright 1996 Adam Twiss, Zeus Technology Ltd,
+            http://www.zeustech.net/
+            Licensed to The Apache Software Foundation, http://www.apache.org/
+
+            Benchmarking localhost (be patient).....done
+            Concurrency Level:      1
+            Time taken for tests:   10.715 seconds
+            Complete requests:      100
+            Failed requests:        0
+            Write errors:           0
+            Total transferred:      44200 bytes
+            HTML transferred:       20400 bytes
+            Requests per second:    9.33 [#/sec] (mean)
+            Time per request:       107.152 [ms] (mean)
+            Time per request:       107.152 [ms] (mean, across all concurrent
+            requests)
+            Transfer rate:          4.03 [Kbytes/sec] received
+          </pre>
+        </li>
+      </ul>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Further explorations</h2>
+    </hgroup>
+    <article>
+      <ul class="build">
+        <li>Currently the page is fast for the majority of hits, but slows
+        every five minutes while the page is regenerated. We can around this by
+        allowing a 'grace' period when dirty pages can be served while we're
+        regenerating content</li>
+        <li>Varnish allows us to purge content through an admin port. This is
+        the best of both worlds: we can set a high TTL, and purge content when
+        content is updated</li>
+        <li>Single page webapps present their own caching challenges. Using a
+        RESTful backend allows us to easily set our tolerance for stale content
+        using standard headers</li>
+        <li>Check out the Varnish book: https://www.varnish-software.com/static/book</li>
+    </article>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Questions?</h2>
+    </hgroup>
+  </slide>
+
+  <slide>
+    <hgroup>
+      <h2>Thank you</h2>
+    </hgroup>
+  </slide>
+
+  <slide class="backdrop"></slide>
+
+</slides>
+
+
+<!--[if IE]>
+  <script src="http://ajax.googleapis.com/ajax/libs/chrome-frame/1/CFInstall.min.js"></script>
+  <script>CFInstall.check({mode: 'overlay'});</script>
+<![endif]-->
+</body>
+</html>
